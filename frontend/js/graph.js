@@ -11,22 +11,28 @@ const Graph = {
     _zoom: null,
     _width: 0,
     _height: 0,
+    _initId: 0,
 
     /**
      * Initialize the graph view with full graph data.
      */
     async init() {
-        // Guard: init is triggered twice (hash change + direct call); only the latest render wins
-        const token = this._initToken = (this._initToken || 0) + 1;
+        const initId = ++this._initId;
         const container = document.getElementById('graph-container');
         const svgEl = document.getElementById('graph-svg');
+        if (!container || !svgEl) return;
 
         this._width = container.clientWidth;
         this._height = container.clientHeight;
 
+        // Stop any running simulation
+        if (this._simulation) {
+            this._simulation.stop();
+            this._simulation = null;
+        }
+
         // Clear previous
         d3.select(svgEl).selectAll('*').remove();
-        if (this._simulation) this._simulation.stop();
 
         this._svg = d3.select(svgEl)
             .attr('width', this._width)
@@ -45,7 +51,7 @@ const Graph = {
             .attr('height', this._height)
             .attr('fill', 'url(#bg-gradient)');
 
-        // Arrow marker for directed links
+        // Arrow markers for directed links
         defs.append('marker')
             .attr('id', 'arrowhead')
             .attr('viewBox', '0 -5 10 10')
@@ -56,7 +62,33 @@ const Graph = {
             .attr('orient', 'auto')
             .append('path')
             .attr('d', 'M0,-5L10,0L0,5')
-            .attr('fill', '#4a5568');
+            .attr('fill', '#64748b');
+
+        // Arrow marker for leaf-to-category directed links (bright purple)
+        defs.append('marker')
+            .attr('id', 'arrowhead-category')
+            .attr('viewBox', '0 -5 10 10')
+            .attr('refX', 20)
+            .attr('refY', 0)
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M0,-5L10,0L0,5')
+            .attr('fill', '#a855f7');
+
+        // Arrow marker for resource links
+        defs.append('marker')
+            .attr('id', 'arrowhead-resource')
+            .attr('viewBox', '0 -5 10 10')
+            .attr('refX', 20)
+            .attr('refY', 0)
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M0,-5L10,0L0,5')
+            .attr('fill', '#14b8a6');
 
         // Zoom layer
         this._g = this._svg.append('g');
@@ -70,21 +102,39 @@ const Graph = {
         // Fetch and render
         try {
             const data = await API.fetchGraph();
-            if (token !== this._initToken) return;
+            // If another init was invoked while awaiting API response, ignore stale render
+            if (initId !== this._initId) return;
             this._renderGraph(data);
         } catch (e) {
+            if (initId !== this._initId) return;
             console.error('Failed to load graph:', e);
         }
 
         // Reset button
-        document.getElementById('btn-graph-reset').onclick = () => {
-            this._svg.transition().duration(500)
-                .call(this._zoom.transform, d3.zoomIdentity);
-        };
+        const resetBtn = document.getElementById('btn-graph-reset');
+        if (resetBtn) {
+            resetBtn.onclick = () => {
+                if (this._svg && this._zoom) {
+                    this._svg.transition().duration(500)
+                        .call(this._zoom.transform, d3.zoomIdentity);
+                }
+            };
+        }
     },
 
     _renderGraph(data) {
-        if (!data.nodes.length) return;
+        if (!data || !data.nodes || !data.nodes.length) return;
+
+        // Stop any running simulation before starting a new one
+        if (this._simulation) {
+            this._simulation.stop();
+            this._simulation = null;
+        }
+
+        // Ensure zoom layer is clean before rendering nodes and links
+        if (this._g) {
+            this._g.selectAll('*').remove();
+        }
 
         const { nodes, links } = data;
 
@@ -99,12 +149,81 @@ const Graph = {
         const maxLinks = Math.max(...nodes.map(n => n.linkCount), 1);
         const sizeScale = d3.scaleSqrt().domain([0, maxLinks]).range([5, 18]);
 
-        const adj = new Map(nodes.map(n => [n.id, new Set()]));
-        links.forEach(l => {
-            const sId = typeof l.source === 'object' ? l.source.id : l.source;
-            const tId = typeof l.target === 'object' ? l.target.id : l.target;
-            adj.get(sId)?.add(tId);
-            adj.get(tId)?.add(sId);
+        // Quick lookup map for nodes by id
+        const nodeMap = new Map(nodes.map(n => [n.id, n]));
+        const getNode = (ref) => {
+            if (!ref) return null;
+            if (typeof ref === 'object') return ref;
+            return nodeMap.get(ref);
+        };
+
+        const isCategoryLink = (l) => {
+            const s = getNode(l.source);
+            const t = getNode(l.target);
+            if (!s || !t) return false;
+
+            // 1. Leaf to category (or category to leaf)
+            if ((s.type === 'leaf' && (t.type === 'category' || (Array.isArray(s.categories) && s.categories.includes(t.id)))) ||
+                (t.type === 'leaf' && (s.type === 'category' || (Array.isArray(t.categories) && t.categories.includes(s.id))))) {
+                return true;
+            }
+
+            // 2. Category to parent category (category to category)
+            if (s.type === 'category' && t.type === 'category') {
+                return true;
+            }
+
+            // 3. Category membership via categories array
+            if ((Array.isArray(s.categories) && s.categories.includes(t.id)) ||
+                (Array.isArray(t.categories) && t.categories.includes(s.id))) {
+                return true;
+            }
+
+            return false;
+        };
+        const isLeafToCategory = isCategoryLink;
+
+        const isResourceLink = (l) => {
+            const s = getNode(l.source);
+            const t = getNode(l.target);
+            if (!s || !t) return false;
+            return s.type === 'resource' || t.type === 'resource';
+        };
+
+        const getLinkClass = (l) => {
+            if (isLeafToCategory(l)) return 'graph-link graph-link-category';
+            if (isResourceLink(l)) return 'graph-link graph-link-resource';
+            return 'graph-link graph-link-article';
+        };
+
+        const getLinkMarker = (l) => {
+            if (isLeafToCategory(l)) return 'url(#arrowhead-category)';
+            if (isResourceLink(l)) return 'url(#arrowhead-resource)';
+            return 'url(#arrowhead)';
+        };
+
+        const getLinkDefaultOpacity = (l) => {
+            if (isLeafToCategory(l)) return 0.75;
+            if (isResourceLink(l)) return 0.45;
+            return 0.25; // article-to-article is dimmer
+        };
+
+        const getLinkColor = (l) => {
+            if (isLeafToCategory(l)) return '#a855f7';
+            if (isResourceLink(l)) return '#14b8a6';
+            return '#64748b';
+        };
+
+        const getLinkStrokeWidth = (l) => {
+            if (isLeafToCategory(l)) return 1.5;
+            return 1;
+        };
+
+        // Render category links after article links so bright category links sit on top
+        links.sort((a, b) => {
+            const aCat = isLeafToCategory(a) ? 1 : 0;
+            const bCat = isLeafToCategory(b) ? 1 : 0;
+            return aCat - bCat;
         });
 
         // Force simulation
@@ -112,7 +231,6 @@ const Graph = {
             .force('link', d3.forceLink(links).id(d => d.id).distance(100))
             .force('charge', d3.forceManyBody().strength(-200))
             .force('center', d3.forceCenter(this._width / 2, this._height / 2))
-            .alphaDecay(0.06)
             .force('collision', d3.forceCollide().radius(d => sizeScale(d.linkCount) + 10));
 
         // Links
@@ -120,8 +238,11 @@ const Graph = {
             .selectAll('line')
             .data(links)
             .join('line')
-            .attr('class', 'graph-link')
-            .attr('stroke-width', 1);
+            .attr('class', l => getLinkClass(l))
+            .attr('stroke', l => getLinkColor(l))
+            .attr('stroke-width', l => getLinkStrokeWidth(l))
+            .attr('stroke-opacity', l => getLinkDefaultOpacity(l))
+            .attr('marker-end', l => getLinkMarker(l));
 
         // Nodes group
         const node = this._g.append('g')
@@ -216,22 +337,89 @@ const Graph = {
             tooltip.classList.remove('hidden');
 
             // Highlight connected
-            const connectedIds = adj.get(d.id);
+            const connectedIds = new Set();
+            links.forEach(l => {
+                const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                if (sId === d.id) connectedIds.add(tId);
+                if (tId === d.id) connectedIds.add(sId);
+            });
+
+            // Dim non-connected nodes, keep hovered and directly connected nodes bright
+            node
+                .classed('dimmed', n => n.id !== d.id && !connectedIds.has(n.id))
+                .classed('highlighted', n => n.id === d.id)
+                .classed('connected', n => connectedIds.has(n.id))
+                .attr('opacity', n => n.id === d.id || connectedIds.has(n.id) ? 1 : 0.15);
 
             node.select('.node-shape')
                 .attr('opacity', n => n.id === d.id || connectedIds.has(n.id) ? 1 : 0.2);
 
-            link.attr('stroke-opacity', l => {
-                const sId = typeof l.source === 'object' ? l.source.id : l.source;
-                const tId = typeof l.target === 'object' ? l.target.id : l.target;
-                return sId === d.id || tId === d.id ? 0.8 : 0.1;
-            });
+            // Highlight directly connected links and dim all other links
+            link
+                .classed('highlighted', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    return sId === d.id || tId === d.id;
+                })
+                .classed('dimmed', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    return sId !== d.id && tId !== d.id;
+                })
+                .attr('opacity', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    return (sId === d.id || tId === d.id) ? 1 : 0.05;
+                })
+                .attr('stroke', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    const isConnected = sId === d.id || tId === d.id;
+                    if (isConnected) {
+                        return isLeafToCategory(l) ? '#c084fc' : (isResourceLink(l) ? '#2dd4bf' : '#94a3b8');
+                    }
+                    return getLinkColor(l);
+                })
+                .attr('stroke-width', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    const isConnected = sId === d.id || tId === d.id;
+                    if (isConnected) {
+                        return isLeafToCategory(l) ? 2.2 : 1.5;
+                    }
+                    return getLinkStrokeWidth(l);
+                })
+                .attr('stroke-opacity', l => {
+                    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+                    const isConnected = sId === d.id || tId === d.id;
+                    if (!isConnected) return 0.05;
+                    return isLeafToCategory(l) ? 1 : 0.85;
+                });
+
+            // Bring active links and nodes to top layer
+            link.filter('.highlighted').raise();
+            node.filter('.connected').raise();
+            d3.select(this).raise();
         });
 
         node.on('mouseout', () => {
             tooltip.classList.add('hidden');
+            node
+                .classed('dimmed', false)
+                .classed('highlighted', false)
+                .classed('connected', false)
+                .attr('opacity', 1);
             node.select('.node-shape').attr('opacity', 0.85);
-            link.attr('stroke-opacity', 0.4);
+
+            link
+                .classed('highlighted', false)
+                .classed('dimmed', false)
+                .attr('opacity', 1)
+                .attr('stroke', l => getLinkColor(l))
+                .attr('stroke-width', l => getLinkStrokeWidth(l))
+                .attr('stroke-opacity', l => getLinkDefaultOpacity(l));
         });
 
         // Click to navigate
