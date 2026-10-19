@@ -115,6 +115,7 @@ The auto-generated OpenAPI documentation is available at `/docs` (Swagger UI) an
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -135,6 +136,7 @@ from wikiknowledge.api.search import router as search_router
 from wikiknowledge.api.sources import router as sources_router
 from wikiknowledge.api.sse import create_sse_server
 from wikiknowledge.core.ai_service import AIService
+from wikiknowledge.core.embedding_search import EmbeddingSearchService
 from wikiknowledge.core.graph import KnowledgeGraph
 from wikiknowledge.core.index import KnowledgeIndex
 from wikiknowledge.core.plugins.manager import SourceManager
@@ -154,6 +156,7 @@ graph = KnowledgeGraph(index)
 source_manager = SourceManager(KNOWLEDGE_DIR)
 mcp_server = create_mcp_server(storage, index, graph, source_manager)
 ai_service = AIService(KNOWLEDGE_DIR)
+embedding_service = EmbeddingSearchService(KNOWLEDGE_DIR)
 
 
 @asynccontextmanager
@@ -162,20 +165,23 @@ async def lifespan(app: FastAPI):
     startup_start = time.perf_counter()
     logger.info("Initializing WikiKnowledge...")
 
-    # Initialize storage backend
-    t_storage_start = time.perf_counter()
-    await storage.initialize()
-    storage_time = time.perf_counter() - t_storage_start
-    
-    # Initialize knowledge sources
-    t_sources_start = time.perf_counter()
-    await source_manager.initialize()
-    sources_time = time.perf_counter() - t_sources_start
+    # Initialize storage backend and knowledge sources concurrently
+    t_init_start = time.perf_counter()
+    await asyncio.gather(
+        storage.initialize(),
+        source_manager.initialize(),
+    )
+    init_time = time.perf_counter() - t_init_start
 
     t_index_start = time.perf_counter()
     from wikiknowledge.core.index import rebuild_full_index
     await rebuild_full_index(index, storage, source_manager)
     index_time = time.perf_counter() - t_index_start
+
+    # Initialize embedding search service
+    t_embedding_start = time.perf_counter()
+    await embedding_service.initialize(storage, index, source_manager)
+    embedding_time = time.perf_counter() - t_embedding_start
 
     # Store on app state for access from other routes
     app.state.storage = storage
@@ -184,13 +190,14 @@ async def lifespan(app: FastAPI):
     app.state.ai_service = ai_service
     app.state.mcp_server = mcp_server
     app.state.source_manager = source_manager
+    app.state.embedding_service = embedding_service
 
     # Inject AI configuration into environment on launch
     ai_service.inject_environment()
     total_startup = time.perf_counter() - startup_start
     logger.info(
-        "WikiKnowledge startup complete in %.3fs (storage: %.3fs, sources init: %.3fs, index: %.3fs)",
-        total_startup, storage_time, sources_time, index_time,
+        "WikiKnowledge startup complete in %.3fs (storage+sources init: %.3fs, index: %.3fs, embedding: %.3fs)",
+        total_startup, init_time, index_time, embedding_time,
     )
 
     yield
